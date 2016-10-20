@@ -10,6 +10,9 @@ from core import sfconnector as sf
 import datetime
 from ggplot import *
 from sklearn import preprocessing
+from sklearn.cross_validation import train_test_split
+
+
 
 def static_join(fraud_path, email_path):
     file_1 = pd.read_csv(fraud_path)
@@ -55,21 +58,25 @@ FROM F_SITE_ACTIVITY
 # query snowflake for session activity.
 session_activity_qry = """
 SELECT
-    MAX(SESSION_SK) "SESSION_SK",
-    MIN(ACTIVITY_DT) as ACTIVITY_START,
-    MAX(ACTIVITY_DT) as ACTIVITY_END,
-    MAX(MEMBER_SK) "MEMBER_SK",
-    COUNT(BOUTIQUE_SK) "ITEM_VIEWS",
-    SUM(ACTIVITY_CNT) "TOTAL_ACTIVITY",
-    MAX(DEVICE_CATEGORY_ID) "DEVICE_ID"
+     MAX(SESSION_SK) "SESSION_SK",
+     MIN(ACTIVITY_DT) "ACTIVITY_START",
+     MAX(ACTIVITY_DT) "ACTIVITY_END",
+     MAX(MEMBER_SK) "MEMBER_SK",
+     COUNT(BOUTIQUE_SK) "ITEM_VIEWS",
+     SUM(ACTIVITY_CNT) "TOTAL_ACTIVITY",
+     MAX(DEVICE_CATEGORY_ID) "DEVICE_ID"
 FROM A_BTQ_VISIT_HRLY
+WHERE DATEDIFF('day', ACTIVITY_DT, current_date()) < 120
+    AND DATEDIFF('day', ACTIVITY_DT, current_date()) > 30
+    AND MEMBER_SK != '-998'
+    AND MEMBER_SK != '-999'
+    AND SESSION_SK > 0
 GROUP BY A_BTQ_VISIT_HRLY.MEMBER_SK, A_BTQ_VISIT_HRLY.SESSION_SK
 """
 home_path = os.path.expanduser('~')
 static_path = os.path.join(home_path, 'Documents/Fraud_2')
 f_path = os.path.join(static_path, 'Non_Receipt_Data.csv')
 e_path = os.path.join(static_path, 'SK_TO_EMAIL_ADDR')
-sf_uname, sf_pwd = sf.account_details(os.path.join(home_path, 'Documents/snowflakeauth.txt'))
 
 age_dict = {
     '18 - 25': '20',
@@ -89,8 +96,8 @@ def member_prep():
     fraud_cleaned = fp.df_field_fill_clean(fraud_import, ['Blocked', 'VRP', 'Action'], 'NA')
     fraud_cleaned = fp.df_field_fill_clean(fraud_cleaned, ['Credit_Count'], 0.0)
     # query snowflake for member attributes
-    member_attributes_raw = sf.SnowConnect(mbr_attr_qry, sf_uname, sf_pwd,
-                                       'ADW_QA_DB', 'ADM', 'ADW_QA_QRY_RL', 'QUERY_WH').execute_query()
+    member_attributes_raw = sf.SnowConnect(mbr_attr_qry, 'ADW_QA_DB', 'ADM', 'ADW_QA_QRY_RL',
+                                           'QUERY_WH').execute_query()
     # create features in member_attributes
     member_attributes = member_attributes_raw.copy()
     # cleanup the login count field
@@ -140,35 +147,96 @@ def member_prep():
                     'Effective_Order_QTY', 'Effective_Order_AMT']
     member_filter[scaling_list] = scaler.fit_transform(member_filter[scaling_list])
 
-    return member_filter
-
-member_data = member_prep()
-
-
-
+    return member_filter, fraud_cleaned
 
 
 def session_prep():
 
     # get stats on activity for members
-    session_activity_raw = sf.SnowConnect(session_activity_qry, sf_uname, sf_pwd,
-                                      'ADW_PRD_DB', 'ADM', 'ADW_PRD_QRY_RL', 'QUERY_WH').execute_query()
+    session_activity_raw = sf.SnowConnect(session_activity_qry, 'ADW_PRD_DB', 'ADM', 'ADW_PRD_QRY_RL', 'QUERY_WH').execute_query()
 
     # create a copy
     scaler = preprocessing.MinMaxScaler()
     session_activity = session_activity_raw.copy()
-    session_list = ['BOUTIQUE_CNT', 'TOTAL_ACTIVITY']
+    session_list = ['ITEM_VIEWS', 'TOTAL_ACTIVITY']
     session_activity[session_list] = scaler.fit_transform(session_activity[session_list])
 
-    # calculate the time duration of the session
+    # calculate the time duration of the session - totally useless.  need timestamps.
     ft.deltadate(session_activity, 'Session_Time', session_activity['ACTIVITY_END'],
                  session_activity['ACTIVITY_START'], 's')
+    session_data = session_activity[['MEMBER_SK', 'ITEM_VIEWS', 'TOTAL_ACTIVITY']]
+    return session_data
 
 
-    """
-    ggplot(aes(x='LOGIN_CNT'), data=member_attributes) + geom_histogram()
-    ggplot(member_attributes, aes(x='Active_Age_Days')) + geom_histogram()
-    """
+member_data, fraud_data = member_prep()
+session = session_prep()
+
+# merge the session data to the member data, then to the predictor.
+member_session = pd.merge(left=session, right=member_data, on='MEMBER_SK', how='inner')
+
+full_data = pd.merge(left=member_session, right=fraud_data, on='MEMBER_SK', how='inner')
+
+full_data.loc[full_data['Credit_Count'] > 1, 'result'] = 1
+full_data = fp.df_field_fill_clean(full_data, ['result'], 0.0)
+
+
+full_data.drop(['Blocked', 'VRP', 'Action', 'Credit_Count'], axis=1, inplace=True)
+
+
+# Feature selection
+from sklearn.feature_selection import RFE
+
+from sklearn import cross_validation
+from sklearn.linear_model import LogisticRegression
+from sklearn.decomposition import PCA
+from sklearn import preprocessing
+from sklearn.cross_validation import train_test_split
+col_length = len(full_data.columns)
+
+
+X = full_data.ix[:, 1:col_length - 1]
+Y = full_data.ix[:, col_length - 1]
+
+x_train, x_test, y_train, y_test = train_test_split(X, Y, train_size=0.1, stratify=Y)
+
+# do RFE
+rfe_model = LogisticRegression()
+rfe = RFE(rfe_model, 10, verbose=1)
+rfe_fit = rfe.fit(x_train, y_train)
+
+# report out
+print("Number of Features: %d" % rfe_fit.n_features_)
+print("Selected Features: %s" % rfe_fit.support_)
+print("Feature Ranking: %s" % rfe_fit.ranking_)
+
+# get the fields that we care about:
+support_feat = rfe_fit.support_
+rfe_fields = []
+j = 0
+for i in support_feat:
+
+    if i:
+        rfe_fields.append(j)
+    j += 1
+
+# return the fields of interest.
+rfe_x_train = x_train.iloc[:, rfe_fields]
+rfe_x_test = x_test.iloc[:, rfe_fields]
+
+# now do PCA
+
+pca = PCA(n_components=5)
+pca_fit = pca.fit(x_train)
+print("Explained Variance: %s" % pca_fit.explained_variance_ratio_)
+print(pca_fit.components_)
+#
+
+
+
+"""
+ggplot(aes(x='LOGIN_CNT'), data=member_attributes) + geom_histogram()
+ggplot(member_attributes, aes(x='Active_Age_Days')) + geom_histogram()
+"""
 
 
 def predictor_merge():
